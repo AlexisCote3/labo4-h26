@@ -215,7 +215,7 @@ static int __init setrclavier_init(void){
     }
 
     // Création de la classe de périphérique
-    setrClasse = class_create(THIS_MODULE, CLS_NAME);
+    setrClasse = class_create(CLS_NAME);
     if (IS_ERR(setrClasse)){
       unregister_chrdev(majorNumber, DEV_NAME);
       printk(KERN_ALERT "SETR_CLAVIER_IRQ : Erreur lors de la creation de la classe de peripherique\n");
