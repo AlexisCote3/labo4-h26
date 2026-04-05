@@ -151,6 +151,9 @@ static int pollClavier(void *arg){
     // Déclarez _toutes_ vos variables locales ici (le module est compilé avec un standard générant
     // un warning si une variable est déclarée après toute ligne de code)
     
+    int ligne, colonne;
+    int valeurs[NOMBRE_COLONNES];
+    int etatCourant[NOMBRE_LIGNES][NOMBRE_COLONNES] = {0};
     
     printk(KERN_INFO "SETR_CLAVIER : Poll clavier declenche! \n");
     while(!kthread_should_stop()){           // Permet de s'arrêter en douceur lorsque kthread_stop() sera appelé
@@ -166,6 +169,31 @@ static int pollClavier(void *arg){
       // 3) Selon ces valeurs et le contenu de dernierEtat, détermine si une nouvelle touche a été pressée
       // 4) Met à jour le buffer et dernierEtat en s'assurant d'éviter les race conditions avec le reste du module
 
+      for (ligne = 0; ligne < NOMBRE_LIGNES; ligne++) {
+          // Active la ligne courante, désactive les autres
+          int valeursEcriture[NOMBRE_LIGNES] = {0};
+          valeursEcriture[ligne] = 1;
+          gpiod_set_array_value(gpioEcriture->ndescs, gpioEcriture->desc, valeursEcriture);
+          
+          // Lit les colonnes
+          gpiod_get_array_value(gpioLecture->ndescs, gpioLecture->desc, valeurs);
+          
+          for (colonne = 0; colonne < NOMBRE_COLONNES; colonne++) {
+              etatCourant[ligne][colonne] = valeurs[colonne];
+              if (etatCourant[ligne][colonne] && !dernierEtat[ligne][colonne]) {
+                  // Nouvelle touche pressée
+                  mutex_lock(&sync);
+                  // Ajouter au buffer circulaire
+                  size_t prochainEcriture = (posCouranteEcriture + 1) % TAILLE_BUFFER;
+                  if (prochainEcriture != posCouranteLecture) {  // Buffer pas plein
+                      data[posCouranteEcriture] = valeursClavier[ligne][colonne];
+                      posCouranteEcriture = prochainEcriture;
+                  }
+                  mutex_unlock(&sync);
+              }
+              dernierEtat[ligne][colonne] = etatCourant[ligne][colonne];
+          }
+      }
 
       set_current_state(TASK_INTERRUPTIBLE); // On indique qu'on peut être interrompu
       msleep(pausePollingMs);                // On se met en pause un certain temps
@@ -220,6 +248,28 @@ static int __init setrclavier_init(void){
     //
     // Vous devez également initialiser le mutex de synchronisation.
 
+    gpiod_add_lookup_table(&gpios_table);
+    gpioEcriture = gpiod_get_array(THIS_MODULE, "ecriture", GPIOD_OUT);
+    if (IS_ERR(gpioEcriture)) {
+        gpiod_remove_lookup_table(&gpios_table);
+        device_destroy(setrClasse, MKDEV(majorNumber, 0));
+        class_destroy(setrClasse);
+        unregister_chrdev(majorNumber, DEV_NAME);
+        printk(KERN_ALERT "SETR_CLAVIER : Erreur lors de l'obtention des GPIO d'écriture\n");
+        return PTR_ERR(gpioEcriture);
+    }
+    gpioLecture = gpiod_get_array(THIS_MODULE, "lecture", GPIOD_IN);
+    if (IS_ERR(gpioLecture)) {
+        gpiod_put_array(gpioEcriture);
+        gpiod_remove_lookup_table(&gpios_table);
+        device_destroy(setrClasse, MKDEV(majorNumber, 0));
+        class_destroy(setrClasse);
+        unregister_chrdev(majorNumber, DEV_NAME);
+        printk(KERN_ALERT "SETR_CLAVIER : Erreur lors de l'obtention des GPIO de lecture\n");
+        return PTR_ERR(gpioLecture);
+    }
+    mutex_init(&sync);
+
 
 
     // Le mutex devrait avoir été initialisé avant d'appeler la ligne suivante!
@@ -243,6 +293,10 @@ static void __exit setrclavier_exit(void){
     // Écrivez le code permettant de relâcher (libérer) les GPIO
     // N'oubliez pas également de retirer la table de correspondances avec
     // gpiod_remove_lookup_table
+
+    gpiod_put_array(gpioLecture);
+    gpiod_put_array(gpioEcriture);
+    gpiod_remove_lookup_table(&gpios_table);
 
     // On retire correctement les différentes composantes du pilote
     device_destroy(setrClasse, MKDEV(majorNumber, 0));
@@ -270,6 +324,10 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
     // Déclarez _toutes_ vos variables locales ici (le module est compilé avec un standard générant
     // un warning si une variable est déclarée après toute ligne de code)
 
+    size_t bytes_to_copy = 0;
+    size_t available;
+    int ret;
+
     // TODO
     // Implémentez cette fonction de lecture
     // Celle-ci doit copier N caractères dans le buffer fourni en paramètre, N étant le minimum
@@ -283,6 +341,48 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
     // posCouranteLecture, et vous devez gérer ce cas sans perdre de caractères et en respectant les
     // autres conditions (par exemple, ne jamais copier plus que len caractères).
 
+    mutex_lock(&sync);
+    if (posCouranteEcriture >= posCouranteLecture) {
+        available = posCouranteEcriture - posCouranteLecture;
+    } else {
+        available = TAILLE_BUFFER - posCouranteLecture + posCouranteEcriture;
+    }
+    bytes_to_copy = min(len, available);
+    
+    if (bytes_to_copy > 0) {
+        if (posCouranteEcriture >= posCouranteLecture) {
+            // Simple case: no wrap around
+            ret = copy_to_user(buffer, &data[posCouranteLecture], bytes_to_copy);
+            if (ret != 0) {
+                mutex_unlock(&sync);
+                return -EFAULT;
+            }
+            posCouranteLecture = (posCouranteLecture + bytes_to_copy) % TAILLE_BUFFER;
+        } else {
+            // Wrap around case
+            size_t first_part = TAILLE_BUFFER - posCouranteLecture;
+            if (first_part > bytes_to_copy) {
+                first_part = bytes_to_copy;
+            }
+            ret = copy_to_user(buffer, &data[posCouranteLecture], first_part);
+            if (ret != 0) {
+                mutex_unlock(&sync);
+                return -EFAULT;
+            }
+            posCouranteLecture = (posCouranteLecture + first_part) % TAILLE_BUFFER;
+            bytes_to_copy -= first_part;
+            if (bytes_to_copy > 0) {
+                ret = copy_to_user(buffer + first_part, &data[posCouranteLecture], bytes_to_copy);
+                if (ret != 0) {
+                    mutex_unlock(&sync);
+                    return -EFAULT;
+                }
+                posCouranteLecture = (posCouranteLecture + bytes_to_copy) % TAILLE_BUFFER;
+            }
+        }
+    }
+    mutex_unlock(&sync);
+    return bytes_to_copy;
 }
 
 // On enregistre les fonctions d'initialisation et de destruction
@@ -291,6 +391,6 @@ module_exit(setrclavier_exit);
 
 // Description du module
 MODULE_LICENSE("GPL");            // Licence : laissez "GPL"
-MODULE_AUTHOR("Vous!");           // Vos noms
+MODULE_AUTHOR("A. Côté, P-O Thibault");           // Vos noms
 MODULE_DESCRIPTION("Lecteur de clavier externe par polling");  // Description du module
 MODULE_VERSION("2.0");            // Numéro de version
