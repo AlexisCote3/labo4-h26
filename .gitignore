@@ -1,0 +1,50 @@
+# Fichiers générés par les modules noyau
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+Module.symvers
+modules.order
+
+# Dossiers temporaires du build noyau
+.tmp_versions/
+*.cmd
+.*.cmd
+
+# Fichiers de dépendances / objets liés
+*.a
+*.i
+*.s
+*.lst
+
+# Logs et fichiers temporaires
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+.#*
+
+# Fichiers système
+.DS_Store
+Thumbs.db
+
+# Python / environnement local, au cas où
+.venv/
+venv/
+__pycache__/
+
+# VSCode utilisateur local
+.vscode/*.code-workspace
+.vscode/settings.json
+.vscode/.ropeproject
+
+# Si vous voulez partager les tâches VSCode du projet,
+# ne PAS ignorer tout le dossier .vscode
+# Donc on laisse possibles :
+# .vscode/tasks.json
+# .vscode/launch.json
+# .vscode/extensions.json

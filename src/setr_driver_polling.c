@@ -152,8 +152,10 @@ static int pollClavier(void *arg){
     // un warning si une variable est déclarée après toute ligne de code)
     
     int ligne, colonne;
-    int valeurs[NOMBRE_COLONNES];
+    unsigned long valeursLecture;
+    unsigned long valeursEcriture;
     int etatCourant[NOMBRE_LIGNES][NOMBRE_COLONNES] = {0};
+    size_t prochainEcriture;
     
     printk(KERN_INFO "SETR_CLAVIER : Poll clavier declenche! \n");
     while(!kthread_should_stop()){           // Permet de s'arrêter en douceur lorsque kthread_stop() sera appelé
@@ -171,24 +173,24 @@ static int pollClavier(void *arg){
 
       for (ligne = 0; ligne < NOMBRE_LIGNES; ligne++) {
           // Active la ligne courante, désactive les autres
-          int valeursEcriture[NOMBRE_LIGNES] = {0};
-          valeursEcriture[ligne] = 1;
-          gpiod_set_array_value(gpioEcriture->ndescs, gpioEcriture->desc, valeursEcriture);
-          
+          valeursEcriture = (1UL << ligne);
+          gpiod_set_array_value(gpioEcriture->ndescs, gpioEcriture->desc, gpioEcriture->info, &valeursEcriture);
+
+          valeursLecture = 0;
           // Lit les colonnes
-          gpiod_get_array_value(gpioLecture->ndescs, gpioLecture->desc, valeurs);
+          gpiod_get_array_value(gpioLecture->ndescs, gpioLecture->desc, gpioLecture->info, &valeursLecture);
           
           for (colonne = 0; colonne < NOMBRE_COLONNES; colonne++) {
-              etatCourant[ligne][colonne] = valeurs[colonne];
+              etatCourant[ligne][colonne] = (valeursLecture >> colonne) & 1UL;
               if (etatCourant[ligne][colonne] && !dernierEtat[ligne][colonne]) {
                   // Nouvelle touche pressée
                   mutex_lock(&sync);
                   // Ajouter au buffer circulaire
-                  size_t prochainEcriture = (posCouranteEcriture + 1) % TAILLE_BUFFER;
-                  if (prochainEcriture != posCouranteLecture) {  // Buffer pas plein
-                      data[posCouranteEcriture] = valeursClavier[ligne][colonne];
-                      posCouranteEcriture = prochainEcriture;
-                  }
+                      prochainEcriture = (posCouranteEcriture + 1) % TAILLE_BUFFER;                  
+                      if (prochainEcriture != posCouranteLecture) {  // Buffer pas plein
+                            data[posCouranteEcriture] = valeursClavier[ligne][colonne];
+                            posCouranteEcriture = prochainEcriture;
+                        }
                   mutex_unlock(&sync);
               }
               dernierEtat[ligne][colonne] = etatCourant[ligne][colonne];
@@ -249,7 +251,7 @@ static int __init setrclavier_init(void){
     // Vous devez également initialiser le mutex de synchronisation.
 
     gpiod_add_lookup_table(&gpios_table);
-    gpioEcriture = gpiod_get_array(THIS_MODULE, "ecriture", GPIOD_OUT);
+    gpioEcriture = gpiod_get_array(setrDevice, "ecriture", GPIOD_OUT_LOW);
     if (IS_ERR(gpioEcriture)) {
         gpiod_remove_lookup_table(&gpios_table);
         device_destroy(setrClasse, MKDEV(majorNumber, 0));
@@ -258,7 +260,7 @@ static int __init setrclavier_init(void){
         printk(KERN_ALERT "SETR_CLAVIER : Erreur lors de l'obtention des GPIO d'écriture\n");
         return PTR_ERR(gpioEcriture);
     }
-    gpioLecture = gpiod_get_array(THIS_MODULE, "lecture", GPIOD_IN);
+    gpioLecture = gpiod_get_array(setrDevice, "lecture", GPIOD_IN);
     if (IS_ERR(gpioLecture)) {
         gpiod_put_array(gpioEcriture);
         gpiod_remove_lookup_table(&gpios_table);
@@ -324,9 +326,12 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
     // Déclarez _toutes_ vos variables locales ici (le module est compilé avec un standard générant
     // un warning si une variable est déclarée après toute ligne de code)
 
-    size_t bytes_to_copy = 0;
     size_t available;
-    int ret;
+    size_t total_to_copy;
+    size_t first_part;
+    size_t second_part;
+    size_t start;
+    unsigned long not_copied;
 
     // TODO
     // Implémentez cette fonction de lecture
@@ -347,42 +352,35 @@ static ssize_t dev_read(struct file *filep, char *buffer, size_t len, loff_t *of
     } else {
         available = TAILLE_BUFFER - posCouranteLecture + posCouranteEcriture;
     }
-    bytes_to_copy = min(len, available);
+    total_to_copy  = min(len, available);
     
-    if (bytes_to_copy > 0) {
-        if (posCouranteEcriture >= posCouranteLecture) {
-            // Simple case: no wrap around
-            ret = copy_to_user(buffer, &data[posCouranteLecture], bytes_to_copy);
-            if (ret != 0) {
-                mutex_unlock(&sync);
-                return -EFAULT;
-            }
-            posCouranteLecture = (posCouranteLecture + bytes_to_copy) % TAILLE_BUFFER;
-        } else {
-            // Wrap around case
-            size_t first_part = TAILLE_BUFFER - posCouranteLecture;
-            if (first_part > bytes_to_copy) {
-                first_part = bytes_to_copy;
-            }
-            ret = copy_to_user(buffer, &data[posCouranteLecture], first_part);
-            if (ret != 0) {
-                mutex_unlock(&sync);
-                return -EFAULT;
-            }
-            posCouranteLecture = (posCouranteLecture + first_part) % TAILLE_BUFFER;
-            bytes_to_copy -= first_part;
-            if (bytes_to_copy > 0) {
-                ret = copy_to_user(buffer + first_part, &data[posCouranteLecture], bytes_to_copy);
-                if (ret != 0) {
-                    mutex_unlock(&sync);
-                    return -EFAULT;
-                }
-                posCouranteLecture = (posCouranteLecture + bytes_to_copy) % TAILLE_BUFFER;
-            }
+    if (total_to_copy == 0) {
+        mutex_unlock(&sync);
+        return 0;
+    }
+
+    start = posCouranteLecture;
+    first_part = min(total_to_copy, TAILLE_BUFFER - start);
+    second_part = total_to_copy - first_part;
+
+    not_copied = copy_to_user(buffer, &data[start], first_part);
+    if (not_copied != 0) {
+        mutex_unlock(&sync);
+        return -EFAULT;
+    }
+
+    if (second_part > 0) {
+        not_copied = copy_to_user(buffer + first_part, &data[0], second_part);
+        if (not_copied != 0) {
+            mutex_unlock(&sync);
+            return -EFAULT;
         }
     }
+
+    posCouranteLecture = (posCouranteLecture + total_to_copy) % TAILLE_BUFFER;
+
     mutex_unlock(&sync);
-    return bytes_to_copy;
+    return total_to_copy;
 }
 
 // On enregistre les fonctions d'initialisation et de destruction
